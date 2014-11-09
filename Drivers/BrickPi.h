@@ -38,10 +38,19 @@
 #ifndef __BrickPi_h_
 #define __BrickPi_h_
 
-// #define DEBUG
+#define DEBUG 
 
+#include <unistd.h>
+#include <errno.h>
 #include <wiringPi.h>
+#include <wiringSerial.h>
 
+#ifdef USE_THREADS
+#include <boost/thread.hpp>
+#endif
+
+#define DEBUG 
+__BEGIN_NAMESPACE_STD
 #define PORT_A 0
 #define PORT_B 1
 #define PORT_C 2
@@ -59,11 +68,20 @@
 #define MASK_D1_S 0x10
 
 #define BYTE_MSG_TYPE               0 // MSG_TYPE is the first byte.
-  #define MSG_TYPE_CHANGE_ADDR      1 // Change the UART address.
-  #define MSG_TYPE_SENSOR_TYPE      2 // Change/set the sensor type.
-  #define MSG_TYPE_VALUES           3 // Set the motor speed and direction, and return the sesnors and encoders.
-  #define MSG_TYPE_E_STOP           4 // Float motors immidately
-  #define MSG_TYPE_TIMEOUT_SETTINGS 5 // Set the timeout
+#define MSG_TYPE_CHANGE_ADDR      1 // Change the UART address.
+#define MSG_TYPE_SENSOR_TYPE      2 // Change/set the sensor type.
+#define MSG_TYPE_VALUES           3 // Set the motor speed and direction, and return the sesnors and encoders.
+#define MSG_TYPE_E_STOP           4 // Float motors immidately
+#define MSG_TYPE_TIMEOUT_SETTINGS 5 // Set the timeout
+#define MSG_TYPE_MOTOR          'M' 		// New Motor commands
+
+#define MSG_RESULT_MOTOR_OK       'M'
+#define MSG_RESULT_MOTOR_NOK      MSG_RESULT_MOTOR_OK + 1
+#define MSG_RESULT_MOTOR_I8       MSG_RESULT_MOTOR_OK + 2
+#define MSG_RESULT_MOTOR_U8       MSG_RESULT_MOTOR_OK + 3
+#define MSG_RESULT_MOTOR_I32      MSG_RESULT_MOTOR_OK + 4
+#define MSG_RESULT_MOTOR_U32      MSG_RESULT_MOTOR_OK + 5
+
 
   // New UART address (MSG_TYPE_CHANGE_ADDR)
     #define BYTE_NEW_ADDRESS     1
@@ -142,7 +160,8 @@
 
 long gotten_bits = 0;
 
-void BrickPiTx(unsigned char dest, unsigned char ByteCount, unsigned char OutArray[]);
+static int BrickPiTx(unsigned char dest, unsigned char ByteCount, unsigned char OutArray[]);
+static int BrickPiRx(unsigned char *InBytes, unsigned char *InArray, long timeout);
 
 struct BrickPiStruct{
   unsigned char Address        [2];     // Communication addresses
@@ -268,6 +287,8 @@ struct button upd(struct button b,int port)
 	b.rjy = (BrickPi.SensorI2CIn[port][0][2]&0xff) - 128;
 	return b;
 }
+
+
 //Show button values of the MINDSENSORS PSP controller
 void show_val(struct button b)
 {
@@ -324,6 +345,741 @@ int BrickPiSetTimeout(){
       return -1;
     i++;
   }
+  return 0;
+}
+
+#define MOTOR_PORT_A	0x01
+#define MOTOR_PORT_B	0x02
+#define MOTOR_PORT_C	0x04
+#define MOTOR_PORT_D	0x08
+
+#define MOTOR_CONTROL_SPEED      0x01
+#define MOTOR_CONTROL_RAMP       0x02
+#define MOTOR_CONTROL_RELATIVE   0x04
+#define MOTOR_CONTROL_TACHO      0x08
+#define MOTOR_CONTROL_BRK        0x10
+#define MOTOR_CONTROL_ON         0x20
+#define MOTOR_CONTROL_TIME       0x40
+#define MOTOR_CONTROL_GO         0x80
+
+#define MOTOR_STATUS_SPEED       0x01
+#define MOTOR_STATUS_RAMP        0x02                   // XXX Not used yet
+#define MOTOR_STATUS_MOVING      0x04
+#define MOTOR_STATUS_TACHO       0x08
+#define MOTOR_STATUS_BRK         0x10
+#define MOTOR_STATUS_OVERLOAD    0x20                   // XXX not used yet
+#define MOTOR_STATUS_TIME        0x40
+#define MOTOR_STATUS_STALL       0x80
+
+#define MOTOR_DIRECTION_FORWARD  0x00
+#define MOTOR_DIRECTION_BACKWARD 0x01
+
+#define MOTOR_RUN_ABSOLUTE       0x00
+#define MOTOR_RUN_RELATIVE       0x01
+
+#define MOTOR_NEXT_ACTION_FLOAT     0x00
+#define MOTOR_NEXT_ACTION_BRAKE     0x01
+#define MOTOR_NEXT_ACTION_BRAKEHOLD 0x02
+
+#define MOTOR_CONTINUE              0x00
+#define MOTOR_WAIT_TO_COMPLETE      0x01
+
+#ifdef USE_THREADS
+boost::mutex motorMtx;
+
+#define motorMtx_lock()		motorMtx.lock()
+#define motorMtx_unlock()	motorMtx.unlock()
+#else
+#define motorMtx_lock()		;
+#define motorMtx_unlock()	;
+#endif 
+
+// Encoder does 720 ticks/rotation!
+int motorSetEncoderTarget(unsigned char which_motors, signed int encoder) {
+  int i;
+  motorMtx_lock();
+  
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 's';
+      Array[BYTE_MSG_TYPE + 2] = 'E';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      Array[BYTE_MSG_TYPE + 4] = encoder & 0xff;
+      Array[BYTE_MSG_TYPE + 5] = (encoder >> 8) & 0xff;
+      Array[BYTE_MSG_TYPE + 6] = (encoder >> 16) & 0xff;
+      Array[BYTE_MSG_TYPE + 7] = (encoder >> 24) & 0xff;
+      BrickPiTx(BrickPi.Address[i], 8, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived > 1 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_OK) {
+        motorMtx_unlock();
+        return -1;
+      }
+    }
+  }
+  motorMtx_unlock();
+
+  return 0;
+}
+
+int motorGetEncoderTarget(unsigned char which_motors) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      int ret = 0;
+      int k;
+
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 'g';
+      Array[BYTE_MSG_TYPE + 2] = 'E';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      BrickPiTx(BrickPi.Address[i], 4, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived != 5 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_I32) {
+        motorMtx_unlock();
+        return -1;
+      }
+
+      for (k = 4; k > 0; k--) {
+        ret = (ret << 8) | Array[k];
+      }
+
+      motorMtx_unlock();
+      return ret;
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+// The speed in -100 .. 100 !! That's different from the original range!
+int motorSetSpeed(unsigned char which_motors, signed char speed) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 's';
+      Array[BYTE_MSG_TYPE + 2] = 'S';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      Array[BYTE_MSG_TYPE + 4] = speed;
+      BrickPiTx(BrickPi.Address[i], 5, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived > 1 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_OK) {
+        motorMtx_unlock();
+        return -1;
+      }
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+signed char motorGetSpeed(unsigned char which_motors) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 'g';
+      Array[BYTE_MSG_TYPE + 2] = 'S';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      BrickPiTx(BrickPi.Address[i], 4, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived != 2 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_I8) {
+        motorMtx_unlock();
+        return -1;
+      }
+
+      motorMtx_unlock();
+      return (signed char)(Array[1]);
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+// Time in milli seconds but the underlaying resolution might only support > x ms!!
+int motorSetTimeToRun(unsigned char which_motors, unsigned int time) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 's';
+      Array[BYTE_MSG_TYPE + 2] = 'T';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      Array[BYTE_MSG_TYPE + 4] = time & 0xff;
+      Array[BYTE_MSG_TYPE + 5] = (time >> 8) & 0xff;
+      Array[BYTE_MSG_TYPE + 6] = (time >> 16) & 0xff;
+      Array[BYTE_MSG_TYPE + 7] = (time >> 24) & 0xff;
+      BrickPiTx(BrickPi.Address[i], 8, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived > 1 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_OK) {
+        motorMtx_unlock();
+        return -1;
+      }
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+unsigned int motorGetTimeToRun(unsigned char which_motors) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      unsigned int ret = 0;
+      int k;
+
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 'g';
+      Array[BYTE_MSG_TYPE + 2] = 'T';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      BrickPiTx(BrickPi.Address[i], 4, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived != 5 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_U32) {
+        motorMtx_unlock();
+        return -1;
+      }
+
+      for (k = 4; k > 0; k--) {
+        ret = (ret << 8) | Array[k];
+      }
+
+      motorMtx_unlock();
+      return ret;
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+int motorGetEncoderPosition(unsigned char which_motors) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      int ret = 0;
+      int k;
+
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 'g';
+      Array[BYTE_MSG_TYPE + 2] = 'P';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      BrickPiTx(BrickPi.Address[i], 4, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived != 5 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_I32) {
+        motorMtx_unlock();
+        return -1;
+      }
+
+      for (k = 4; k > 0; k--) {
+        ret = (ret << 8) | Array[k];
+      }
+
+      motorMtx_unlock();
+      return ret;
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+unsigned char motorGetStatusByte(unsigned char which_motors) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 'g';
+      Array[BYTE_MSG_TYPE + 2] = 'B';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      BrickPiTx(BrickPi.Address[i], 4, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived != 2 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_U8) {
+        motorMtx_unlock();
+        return -1;
+      }
+
+      motorMtx_unlock();
+      return (unsigned char)(Array[1]);
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+// If a motor in a bank is included, both motors of that bank will be reset!
+int motorBankReset(unsigned char which_motors) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 'r';
+      BrickPiTx(BrickPi.Address[i], 2, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived > 1 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_OK) {
+        motorMtx_unlock();
+        return -1;
+      }
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+// If a motor in a bank is included, both motors of that bank will be started!
+int motorBankStartBothInSync(unsigned char which_motors) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 's';
+      Array[BYTE_MSG_TYPE + 2] = 'I';
+      BrickPiTx(BrickPi.Address[i], 3, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived > 1 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_OK) {
+        motorMtx_unlock();
+        return -1;
+      }
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+int motorResetEncoder(unsigned char which_motors) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 'r';
+      Array[BYTE_MSG_TYPE + 2] = 'E';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      BrickPiTx(BrickPi.Address[i], 4, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived > 1 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_OK) {
+        motorMtx_unlock();
+        return -1;
+      }
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+int motorSetSpeedTimeAndControl(unsigned char which_motors, signed char speed,
+                                unsigned int duration, unsigned char control) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 's';
+      Array[BYTE_MSG_TYPE + 2] = 'Z';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      Array[BYTE_MSG_TYPE + 4] = speed;
+      Array[BYTE_MSG_TYPE + 5] = duration & 0xff;
+      Array[BYTE_MSG_TYPE + 6] = (duration >> 8) & 0xff;
+      Array[BYTE_MSG_TYPE + 7] = (duration >> 16) & 0xff;
+      Array[BYTE_MSG_TYPE + 8] = (duration >> 24) & 0xff;
+      Array[BYTE_MSG_TYPE + 9] = control;
+      BrickPiTx(BrickPi.Address[i], 10, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived > 1 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_OK) {
+        motorMtx_unlock();
+        return -1;
+      }
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+int motorSetEncoderSpeedTimeAndControl(unsigned char which_motors,
+                                       signed int encoder, signed char speed,
+                                       unsigned int duration, unsigned char control) {
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 's';
+      Array[BYTE_MSG_TYPE + 2] = 'Y';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      Array[BYTE_MSG_TYPE + 4] = encoder & 0xff;
+      Array[BYTE_MSG_TYPE + 5] = (encoder >> 8) & 0xff;
+      Array[BYTE_MSG_TYPE + 6] = (encoder >> 16) & 0xff;
+      Array[BYTE_MSG_TYPE + 7] = (encoder >> 24) & 0xff;
+      Array[BYTE_MSG_TYPE + 8] = speed;
+      Array[BYTE_MSG_TYPE + 9] = duration & 0xff;
+      Array[BYTE_MSG_TYPE + 10] = (duration >> 8) & 0xff;
+      Array[BYTE_MSG_TYPE + 11] = (duration >> 16) & 0xff;
+      Array[BYTE_MSG_TYPE + 12] = (duration >> 24) & 0xff;
+      Array[BYTE_MSG_TYPE + 13] = control;
+      BrickPiTx(BrickPi.Address[i], 14, Array);
+  
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+  
+      if (BytesReceived > 1 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_OK) {
+        motorMtx_unlock();
+        return -1;
+      }
+    }
+  }
+
+  motorMtx_unlock();
+  return 0;
+}
+
+unsigned char motorIsTimeDone(unsigned char which_motors) {
+  unsigned char ret = 0;
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 'i';
+      Array[BYTE_MSG_TYPE + 2] = 'T';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      BrickPiTx(BrickPi.Address[i], 4, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+      
+      if (BytesReceived != 2 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_U8) {
+        motorMtx_unlock();
+        return -1;
+      }
+
+      ret |= (unsigned char)(Array[1]);
+    }
+  }
+
+  motorMtx_unlock();
+  return ret;
+}
+
+unsigned char motorIsTachoDone(unsigned char which_motors) {
+  unsigned char ret = 0;
+  int i;
+  motorMtx_lock();
+
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 'i';
+      Array[BYTE_MSG_TYPE + 2] = 'P';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      BrickPiTx(BrickPi.Address[i], 4, Array);
+      
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      } 
+      
+      if (BytesReceived != 2 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_U8) {
+        motorMtx_unlock();
+        return -1;
+      } 
+      
+      ret |= (unsigned char)(Array[1]);
+    } 
+  } 
+  
+  motorMtx_unlock();
+  return ret;
+} 
+
+unsigned char motorWaitUntilTimeDone(unsigned char which_motors) {
+  unsigned char ret = 0;
+
+  printf("motorWaitUntilTimeDone(%d)->", which_motors);
+
+  usleep(50 * 1000);					// 50 milliseconds
+
+  ret = motorIsTimeDone(which_motors);
+
+  while (ret & MOTOR_STATUS_TIME) {
+    if (ret & MOTOR_STATUS_STALL) {
+      printf("stall\n");
+      return MOTOR_STATUS_STALL;
+    }
+
+    printf(".");
+
+    usleep(50 * 1000);
+    ret = motorIsTimeDone(which_motors);
+  }
+
+  printf("done\n");
+  return 0;
+}
+
+unsigned char motorWaitUntilTachoDone(unsigned char which_motors) {
+  unsigned char ret = 0;
+
+  usleep(50 * 1000);                                    // 50 milliseconds
+
+  ret = motorIsTachoDone(which_motors);
+
+  while (ret & MOTOR_STATUS_TACHO) {
+    if (ret & MOTOR_STATUS_STALL) {
+      return MOTOR_STATUS_STALL;
+    } 
+    
+    usleep(50 * 1000);
+    ret = motorIsTachoDone(which_motors);
+  }
+
+  return 0;
+}
+
+static inline signed char motorCalcFinalSpeed(signed char initialSpeed, unsigned char direction) {
+  if (direction == MOTOR_DIRECTION_FORWARD) {
+    return initialSpeed;
+  }
+
+  return -initialSpeed;
+}
+
+// XXX: BrakeHold is not yet implemented!
+static inline unsigned char motorCalcNextActionBits(unsigned char next_action) {
+  if (next_action == MOTOR_NEXT_ACTION_BRAKE) {
+    return MOTOR_CONTROL_BRK;
+  }
+  else if (next_action == MOTOR_NEXT_ACTION_BRAKEHOLD) {
+    return MOTOR_CONTROL_BRK | MOTOR_CONTROL_ON;
+  }
+
+  return 0;
+}
+
+void motorRunUnlimited(unsigned char which_motors, unsigned char direction,
+                       signed char speed) {
+  unsigned char ctrl = MOTOR_CONTROL_SPEED | MOTOR_CONTROL_GO;
+  signed char sp = motorCalcFinalSpeed(speed, direction);
+  motorSetSpeedTimeAndControl(which_motors, sp, 0, ctrl);
+}
+
+unsigned char motorRunMilliSeconds(unsigned char which_motors, unsigned char direction,
+                                   signed char speed, unsigned int duration,
+                                   unsigned char wait_for_completion,
+                                   unsigned char next_action) {
+  signed char sp = motorCalcFinalSpeed(speed, direction);
+  unsigned char ctrl = MOTOR_CONTROL_SPEED | MOTOR_CONTROL_TIME | MOTOR_CONTROL_GO;
+  ctrl |= motorCalcNextActionBits(next_action);
+  motorSetSpeedTimeAndControl(which_motors, sp, duration, ctrl);
+
+  if (wait_for_completion == MOTOR_WAIT_TO_COMPLETE) {
+    return motorWaitUntilTimeDone(which_motors);
+  }
+
+  return 0;
+}
+
+unsigned char motorRunTachometer(unsigned char which_motors, unsigned char direction,
+                                 signed char speed, signed int tachometer,
+                                 unsigned char relative,
+                                 unsigned char wait_for_completion,
+                                 unsigned char next_action) {
+  signed char sp = motorCalcFinalSpeed(speed, direction);
+  unsigned char ctrl = MOTOR_CONTROL_SPEED | MOTOR_CONTROL_TACHO | MOTOR_CONTROL_GO;
+  ctrl |= motorCalcNextActionBits(next_action);
+
+  // The tachometer can be absolute or relative.
+  // If it is absolute, we ignore the direction parameter.
+  signed int final_tach = tachometer;
+
+  if (relative == MOTOR_RUN_RELATIVE) {
+    ctrl |= MOTOR_CONTROL_RELATIVE;
+
+    // a (relative) forward command is always a positive tachometer reading
+    final_tach = abs(tachometer);
+    if (sp < 0) {
+      // and a (relative) reverse command is always negative
+      final_tach = -final_tach;
+    }
+  }
+
+  motorSetEncoderSpeedTimeAndControl(which_motors, final_tach, sp, 0, ctrl);
+
+  if (wait_for_completion == MOTOR_WAIT_TO_COMPLETE) {
+    return motorWaitUntilTachoDone(which_motors);
+  }
+
+  return 0;
+}
+
+unsigned char motorRunDegrees(unsigned char which_motors, unsigned char direction,
+                              signed char speed, signed int degrees,
+                              unsigned char wait_for_completion,
+                              unsigned char next_action) {
+  return motorRunTachometer(which_motors, direction, speed, degrees * 2,
+      MOTOR_RUN_RELATIVE, wait_for_completion, next_action);
+}
+
+unsigned char motorRunRotations(unsigned char which_motors, unsigned char direction,
+                                signed char speed, signed int rotations,
+                                unsigned char wait_for_completion,
+                                unsigned char next_action) {
+  return motorRunTachometer(which_motors, direction, speed, rotations * 360 * 2,
+      MOTOR_RUN_RELATIVE, wait_for_completion, next_action);
+}
+
+int motorStop(unsigned char which_motors, unsigned char next_action) {
+  int i;
+  motorMtx_lock();
+  
+  for (i = 0; i < 2; i++) {
+    unsigned char wm = (which_motors >> (i * 2)) & 0x03;
+
+    if (wm) {
+      Array[BYTE_MSG_TYPE] = MSG_TYPE_MOTOR;
+      Array[BYTE_MSG_TYPE + 1] = 's';
+      Array[BYTE_MSG_TYPE + 2] = 'p';
+      Array[BYTE_MSG_TYPE + 3] = wm;
+      Array[BYTE_MSG_TYPE + 4] = next_action;
+      BrickPiTx(BrickPi.Address[i], 5, Array);
+
+      if (BrickPiRx(&BytesReceived, Array, 20000)) {
+        motorMtx_unlock();
+        return -2;
+      }
+
+      if (BytesReceived > 1 || Array[BYTE_MSG_TYPE] != MSG_RESULT_MOTOR_OK) {
+        motorMtx_unlock();
+        return -1;
+      }
+    }
+  }
+
+  motorMtx_unlock();
   return 0;
 }
 
@@ -424,8 +1180,9 @@ int BrickPiSetupSensors(){
     }
     unsigned char UART_TX_BYTES = (((Bit_Offset + 7) / 8) + 3);
     BrickPiTx(BrickPi.Address[i], UART_TX_BYTES, Array);
-    if(BrickPiRx(&BytesReceived, Array, 5000000))
+    if(BrickPiRx(&BytesReceived, Array, 5000000)) {
       return -1;
+    }
     if(!(BytesReceived == 1 && Array[BYTE_MSG_TYPE] == MSG_TYPE_SENSOR_TYPE))
       return -1;
     i++;
@@ -588,20 +1345,22 @@ __RETRY_COMMUNICATION__:
         break;          
         case TYPE_SENSOR_I2C:
         case TYPE_SENSOR_I2C_9V:
+          {
 		//US Fix Starts
 		case TYPE_SENSOR_ULTRASONIC_CONT:
 		//US Fix Ends
-          BrickPi.Sensor[port] = GetBits(1, 0, BrickPi.SensorI2CDevices[port]);
-          unsigned char device = 0;
-          while(device < BrickPi.SensorI2CDevices[port]){
-            if(BrickPi.Sensor[port] & (0x01 << device)){
-              unsigned char in_byte = 0;
-              while(in_byte < BrickPi.SensorI2CRead[port][device]){
-                BrickPi.SensorI2CIn[port][device][in_byte] = GetBits(1, 0, 8);
-                in_byte++;
+            BrickPi.Sensor[port] = GetBits(1, 0, BrickPi.SensorI2CDevices[port]);
+            unsigned char device = 0;
+            while(device < BrickPi.SensorI2CDevices[port]){
+              if(BrickPi.Sensor[port] & (0x01 << device)){
+                unsigned char in_byte = 0;
+                while(in_byte < BrickPi.SensorI2CRead[port][device]){
+                  BrickPi.SensorI2CIn[port][device][in_byte] = GetBits(1, 0, 8);
+                  in_byte++;
+                }
               }
+              device++;
             }
-            device++;
           }
         break;      
         case TYPE_SENSOR_EV3_US_M0       :
@@ -625,7 +1384,7 @@ __RETRY_COMMUNICATION__:
         case TYPE_SENSOR_EV3_INFRARED_M3 :
         case TYPE_SENSOR_EV3_INFRARED_M4 :
         case TYPE_SENSOR_EV3_INFRARED_M5 :
-		case TYPE_SENSOR_EV3_TOUCH_0:
+        case TYPE_SENSOR_EV3_TOUCH_0:
           BrickPi.Sensor[port] = GetBits(1, 0, 16);
           // gotten_bits = GetBits(1, 0, 16);		  		// Just test code
 		  // printf("First Test: %d \n", gotten_bits );		// Just test code
@@ -673,82 +1432,86 @@ __RETRY_COMMUNICATION__:
 
 int UART_file_descriptor = 0; 
 
-int BrickPiSetup(){
+int BrickPiSetup() {
   UART_file_descriptor = serialOpen("/dev/ttyAMA0", 500000);
-  if(UART_file_descriptor == -1){
+
+  if (UART_file_descriptor < 0) {
     return -1;
   }
   return 0;
 }
 
-void BrickPiTx(unsigned char dest, unsigned char ByteCount, unsigned char OutArray[]){
+static int BrickPiTx(unsigned char dest, unsigned char ByteCount, unsigned char OutArray[]) {
   unsigned char tx_buffer[256];
   tx_buffer[0] = dest;
   tx_buffer[1] = dest + ByteCount;
-  tx_buffer[2] = ByteCount;  
-  unsigned char i = 0;
-  while(i < ByteCount){
+  tx_buffer[2] = ByteCount;
+  unsigned char i;
+
+  for (i = 0; i < ByteCount; i++) {
     tx_buffer[1] += OutArray[i];
     tx_buffer[i + 3] = OutArray[i];
-    i++;
   }
-  i = 0;
-  while(i < (ByteCount + 3)){
-    serialPutchar(UART_file_descriptor, tx_buffer[i]);
-    i++;
-  }
+
+  return write(UART_file_descriptor, tx_buffer, ByteCount + 3);
 }
 
-int BrickPiRx(unsigned char *InBytes, unsigned char *InArray, long timeout){  // timeout in uS, not mS
+static int BrickPiRx(unsigned char *InBytes, unsigned char InArray[], long timeout) {  // timeout in uS, not mS
   unsigned char rx_buffer[256];
   unsigned char RxBytes = 0;
   unsigned char CheckSum = 0;
   unsigned char i = 0;
   int result;
   unsigned long OrigionalTick = CurrentTickUs();
-  while(serialDataAvail(UART_file_descriptor) <= 0){
-    if(timeout && ((CurrentTickUs() - OrigionalTick) >= timeout))return -2;
+
+  while (serialDataAvail(UART_file_descriptor) <= 0) {
+    if (timeout && ((CurrentTickUs() - OrigionalTick) >= timeout)) {
+      return -2;
+    }
   }
 
   RxBytes = 0;
-  while(RxBytes < serialDataAvail(UART_file_descriptor)){                                   // If it's been 1 ms since the last data was received, assume it's the end of the message.
+  while (RxBytes < serialDataAvail(UART_file_descriptor)) {    // If it's been 1 ms since the last
+                                                               // data was received, assume it's the
+                                                               //end of the message.
     RxBytes = serialDataAvail(UART_file_descriptor);
-    usleep(75);
+    usleep(500); // MARCO how do 75 us compare to the comment about 1 ms?
   }
   
-  i = 0;  
-  while(i < RxBytes){
+  for (i = 0; i < RxBytes; i++) {
     result = serialGetchar(UART_file_descriptor);
-    if(result >= 0){
+
+    if (result >= 0) {
       rx_buffer[i] = result;
     }
-    else{      
+    else {      
       return -1;    
     }
-    i++;    
   }
 
-  if(RxBytes < 2)
+  if (RxBytes < 2) {
     return -4;
+  }
   
-  if(RxBytes < (rx_buffer[1] + 2))
+  if (RxBytes < (rx_buffer[1] + 2)) {
     return -6;
+  }
   
   CheckSum = rx_buffer[1];
   
-  i = 0;
-  while(i < (RxBytes - 2)){
-    CheckSum += rx_buffer[i + 2];
-    InArray[i] = rx_buffer[i + 2];
-    i++;
+  for (i = 2; i < RxBytes; i++) {
+    CheckSum += rx_buffer[i];
+    InArray[i - 2] = rx_buffer[i];
   }
   
-  if(CheckSum != rx_buffer[0])
+  if (CheckSum != rx_buffer[0]) {
     return -5;
+  }
   
   *InBytes = (RxBytes - 2);
 
   return 0;  
 }
+__END_NAMESPACE_STD
 
 #endif

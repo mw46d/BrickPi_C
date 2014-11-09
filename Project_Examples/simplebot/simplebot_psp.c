@@ -25,18 +25,18 @@
 #include <fcntl.h>
 #define I2C_PORT  PORT_1 
 #define I2C_SPEED 6
-// gcc -o program simplebot_psp.c -lrt -lm -L/usr/local/lib -lwiringPi
-// ./program
+// gcc -o simplebot_psp -I ../../Drivers/ simplebot_psp.c -lrt -lm -L/usr/local/lib -lwiringPi
+// ./simplebot_psp
 
-int result,speed=200;//Set the speed
+int result,speed = 70;//Set the speed
 int motor1,motor2;
 char cmd;	//last used command (used when increasing or decreasing speed)
 #undef DEBUG
 //Move the simplebot depending on the command
 void move_bot(int m1s,int m2s)
 {
-	BrickPi.MotorSpeed[motor1] = m1s;
-	BrickPi.MotorSpeed[motor2] = m2s;
+	motorSetSpeed(motor1, m1s);
+	motorSetSpeed(motor2, m2s);
 }
 int main() 
 {
@@ -52,10 +52,12 @@ int main()
 	BrickPi.Address[0] = 1;
 	BrickPi.Address[1] = 2;
 
-	motor1=PORT_B;	//Select the ports to be used by the motors
-	motor2=PORT_C; 
-	BrickPi.MotorEnable[motor1] = 1;	//Enable the motors
-	BrickPi.MotorEnable[motor2] = 1;
+	motor1 = MOTOR_PORT_B;	//Select the ports to be used by the motors
+	motor2 = MOTOR_PORT_C; 
+
+	result = motorBankReset(motor1);
+	result = motorBankReset(motor2);
+
 	BrickPi.SensorType       [I2C_PORT]    = TYPE_SENSOR_I2C;
 	BrickPi.SensorI2CSpeed   [I2C_PORT]    = I2C_SPEED;
 	BrickPi.SensorI2CDevices [I2C_PORT]    = 1;
@@ -81,7 +83,7 @@ int main()
 			b1=upd(b1,I2C_PORT);
 			m1speed=b1.ljy+b1.ljx;
 			m2speed=b1.rjy+b1.rjx;
-			move_bot(m1speed*2,m2speed*2);			//Move the bot
+			move_bot(m1speed,m2speed);			//Move the bot
 			
 			BrickPiUpdateValues();	//Update the motor values
 			usleep(10000);			//sleep for 10 ms

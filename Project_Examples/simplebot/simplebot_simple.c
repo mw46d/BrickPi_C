@@ -29,41 +29,38 @@
 #include "BrickPi.h"
 #include <linux/i2c-dev.h>  
 #include <fcntl.h>
-// gcc -o program simplebot_simple.c -lrt -lm -L/usr/local/lib -lwiringPi
-// ./program
+// gcc -o simplebot_simple simplebot_simple.c -lrt -lm -L/usr/local/lib -lwiringPi
+// ./simplebot_simple
 
-int result,speed=200;//Set the speed
+int result,speed = 70;//Set the speed
 int motor1,motor2;
 #undef DEBUG
 //Move Forward
 void fwd(void)
 {
-	BrickPi.MotorSpeed[motor1] = speed;
-	BrickPi.MotorSpeed[motor2] = speed;
+	motorSetSpeed(motor1 | motor2, speed);
 }
 //Move Left
 void left(void)
 {
-	BrickPi.MotorSpeed[motor1] = speed;  
-	BrickPi.MotorSpeed[motor2] = -speed;
+	motorSetSpeed(motor1, speed);
+	motorSetSpeed(motor2, -speed);
 }
 //Move Right
 void right(void)
 {
-	BrickPi.MotorSpeed[motor1] = -speed;  
-	BrickPi.MotorSpeed[motor2] = speed;
+	motorSetSpeed(motor1, -speed);
+	motorSetSpeed(motor2, speed);
 }
 //Move backward
 void back(void)
 {
-	BrickPi.MotorSpeed[motor1] = -speed;  
-	BrickPi.MotorSpeed[motor2] = -speed;
+	motorSetSpeed(motor1 | motor2, -speed);
 }
 //Stop
 void stop(void)
 {
-	BrickPi.MotorSpeed[motor1] = 0;  
-	BrickPi.MotorSpeed[motor2] = 0;
+	motorStop(motor1 | motor2, MOTOR_NEXT_ACTION_BRAKE);
 }	
 
 int main() 
@@ -79,10 +76,12 @@ int main()
 	BrickPi.Address[0] = 1;
 	BrickPi.Address[1] = 2;
 
-	motor1=PORT_B;	//Select the ports to be used by the motors
-	motor2=PORT_C; 
-	BrickPi.MotorEnable[motor1] = 1;	//Enable the motors
-	BrickPi.MotorEnable[motor2] = 1;
+	motor1 = MOTOR_PORT_B;	//Select the ports to be used by the motors
+	motor2 = MOTOR_PORT_C; 
+
+	result = motorBankReset(motor1);
+	result = motorBankReset(motor2);
+
 	result = BrickPiSetupSensors();		//Set up the properties of sensors for the BrickPi
 	//printf("BrickPiSetupSensors: %d\n", result); 
 	BrickPi.Timeout=3000;				//Set timeout value for the time till which to run the motors after the last command is pressed
@@ -104,7 +103,7 @@ int main()
 			else if (inp=='x')
 				stop();
 			BrickPiUpdateValues();	//Update the motor values
-			usleep(10000);			//sleep for 10 ms
+			usleep(20000);			//sleep for 20 ms
 		}
 	}
 	return 0;
